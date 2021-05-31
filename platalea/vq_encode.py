@@ -6,11 +6,11 @@ import os
 import os.path
 import numpy as np
 import torch
-from pathlib import Path
 
+config = dict(type='mfcc', delta=True, alpha=0.97, n_filters=40,  window_size=0.025, frame_shift=0.010)
 
 def encode(net, datadir, outdir):
-    paths = glob.glob(datadir +  "/*.wav")
+    paths = glob.glob(datadir + "/*.wav")
     assert len(paths) > 0
     try:
         feat = torch.load(datadir + "_audiofeat.pt")
@@ -29,6 +29,7 @@ def encode(net, datadir, outdir):
 
 def encode_zerospeech(net, outdir='.'):
     encode(net, "/roaming/gchrupal/verdigris/platalea.vq/data/2020/2019/english/test/")
+
 
 def evaluate_zerospeech(net, outdir='.'):
     encode_zerospeech(net, outdir=outdir)
