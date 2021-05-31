@@ -1,5 +1,5 @@
+from collections import namedtuple
 import json
-import logging
 import numpy as np
 import pathlib
 import pickle
@@ -9,47 +9,36 @@ import torch
 import torch.utils.data
 
 
-class TranscribedDataset():
-    le = None
-    sos = '<sos>'
-    eos = '<eos>'
-    pad = '<pad>'
-    unk = '<unk>'
+tokenizer = None
 
-    @classmethod
-    def init_vocabulary(cls, transcriptions):
-        cls.le = LabelEncoder()
-        tokens = [cls.sos, cls.eos, cls.unk, cls.pad] + \
-                 [c for t in transcriptions for c in t]
-        cls.le.fit(tokens)
+SpecialTokens = namedtuple('SpecialTokens', ['eos', 'pad', 'sos', 'unk'])
+special_tokens = SpecialTokens('<eos>', '<pad>', '<sos>', '<unk>')
 
-    @classmethod
-    def get_label_encoder(cls):
-        if cls.le is None:
-            raise ValueError('Vocabulary not initialized.')
-        return cls.le
+# Number of files to keep in the debug mode
+NB_DEBUG = 50
 
-    @classmethod
-    def get_token_id(cls, token):
-        return cls.get_label_encoder().transform([token])[0]
-
-    @classmethod
-    def vocabulary_size(cls):
-        return len(cls.get_label_encoder().classes_)
-
-    @classmethod
-    def caption2tensor(cls, capt):
-        le = cls.get_label_encoder()
-        capt = [c if c in le.classes_ else cls.unk for c in capt]
-        capt = [cls.sos] + capt + [cls.eos]
-        return torch.Tensor(le.transform(capt))
+def init_vocabulary(transcriptions):
+    global tokenizer
+    tokenizer = LabelEncoder()
+    tokens = list(special_tokens) + [c for t in transcriptions for c in t]
+    tokenizer.fit(tokens)
 
 
-class Flickr8KData(torch.utils.data.Dataset, TranscribedDataset):
+def get_token_id(token):
+    return tokenizer.transform([token])[0]
+
+
+def caption2tensor(capt):
+    capt = [c if c in tokenizer.classes_ else special_tokens.unk for c in capt]
+    capt = [special_tokens.sos] + capt + [special_tokens.eos]
+    return torch.Tensor(tokenizer.transform(capt))
+
+
+class Flickr8KData(torch.utils.data.Dataset):
     @classmethod
     def init_vocabulary(cls, dataset):
         transcriptions = [sd[2] for sd in dataset.split_data]
-        TranscribedDataset.init_vocabulary(transcriptions)
+        init_vocabulary(transcriptions)
 
     def __init__(self, root, feature_fname, meta_fname, split='train', language='en',
                  downsampling_factor=None):
@@ -70,7 +59,8 @@ class Flickr8KData(torch.utils.data.Dataset, TranscribedDataset):
         # Loading label encoder
         module_path = pathlib.Path(__file__).parent
         with open(module_path / 'label_encoders.pkl', 'rb') as f:
-            self.__class__.le = pickle.load(f)[language]
+            global tokenizer
+            tokenizer = pickle.load(f)[language]
         # Loading metadata
         with open(root_path / meta_fname) as fmeta:
             metadata = json.load(fmeta)['images']
@@ -81,6 +71,7 @@ class Flickr8KData(torch.utils.data.Dataset, TranscribedDataset):
                 audio_id, image_id, text_id = line.split()
                 text_id = int(text_id[1:])
                 self.image_captions[image_id] = self.image_captions.get(image_id, []) + [(text_id, audio_id)]
+
         # Creating image, caption pairs
         self.split_data = []
         for image in metadata:
@@ -114,7 +105,7 @@ class Flickr8KData(torch.utils.data.Dataset, TranscribedDataset):
         sd = self.split_data[index]
         image = self.image[sd[0]]
         audio = self.audio[sd[1]]
-        text = self.caption2tensor(sd[2])
+        text = caption2tensor(sd[2])
         return dict(image_id=sd[0],
                     audio_id=sd[1],
                     image=image,
@@ -165,11 +156,11 @@ class Flickr8KData(torch.utils.data.Dataset, TranscribedDataset):
             return [s.split() for s in sentences]
 
 
-class LibriSpeechData(torch.utils.data.Dataset, TranscribedDataset):
+class LibriSpeechData(torch.utils.data.Dataset):
     @classmethod
     def init_vocabulary(cls, dataset):
         transcriptions = [m['trn'] for m in dataset.metadata]
-        TranscribedDataset.init_vocabulary(transcriptions)
+        init_vocabulary(transcriptions)
 
     def __init__(self, root, feature_fname, meta_fname, split='train',
                  downsampling_factor=None):
@@ -199,7 +190,7 @@ class LibriSpeechData(torch.utils.data.Dataset, TranscribedDataset):
     def __getitem__(self, index):
         sd = self.metadata[index]
         audio = torch.from_numpy(self.audio[sd['audio_start']:sd['audio_end']])
-        text = self.caption2tensor(sd['trn'])
+        text = caption2tensor(sd['trn'])
         return dict(audio_id=sd['fileid'], text=text, audio=audio)
 
     def __len__(self):
@@ -220,6 +211,153 @@ class LibriSpeechData(torch.utils.data.Dataset, TranscribedDataset):
         return dict(audio=audio, text=text)
 
 
+class SpokenCOCOData(torch.utils.data.Dataset):
+    @classmethod
+    def init_vocabulary(cls, dataset):
+        transcriptions = [sd[2] for sd in dataset.split_data]
+        init_vocabulary(transcriptions)
+
+    def __init__(self, root, feature_fname, meta_fname, split='train',
+                 downsampling_factor=None, debug=False):
+
+        if feature_fname.endswith('.pt'):
+            raise ValueError("Training on SpokenCOCO is not possible with .pt files. Please provide --audio_features_fn "
+                             "that points to .memmap files.")
+
+        self.root = root
+        self.split = split
+        self.feature_fname = feature_fname
+        self.language = 'en'
+        self.root = root
+        self.split = split
+        root_path = pathlib.Path(root)
+        # Loading label encoder
+        module_path = pathlib.Path(__file__).parent
+        with open(module_path / 'label_encoders.pkl', 'rb') as f:
+            global tokenizer
+            tokenizer = pickle.load(f)[self.language]
+
+        if split != "train":
+            if split == "val":
+                meta_fname = meta_fname.replace('train', 'val')
+            else:
+                raise ValueError("Split == %s not defined for SpokenCOCO" % split)
+
+        # Loading metadata
+        with open(root_path / meta_fname) as fmeta:
+            metadata = json.load(fmeta)['data']
+
+        image_feature_fname = 'resnet_features.memmap'
+        if debug:
+            image_feature_fname = image_feature_fname.replace('.memmap', '_debug.memmap')
+            feature_fname = feature_fname.replace('.memmap', '_debug.memmap')
+            metadata = metadata[0:NB_DEBUG]
+
+        # Loading mapping from image id to list of caption id
+        self.image_captions = {}
+        # And creating image, caption pairs
+        self.split_data = []
+        for sample in metadata:
+            img_id = sample['image']
+            caption_list = []
+            for caption in sample['captions']:
+                caption_list.append((caption['uttid'], caption['wav']))
+                self.split_data.append((img_id, caption['wav'], caption['text']))
+            self.image_captions[img_id] = caption_list
+
+        # Downsampling
+        if downsampling_factor is not None:
+            num_examples = int(len(self.split_data) // downsampling_factor)
+            self.split_data = random.sample(self.split_data, num_examples)
+
+        # Load memory map metadata
+        mmap_meta_fname = root_path / (image_feature_fname.replace('.memmap', '_memmap_mapping.json'))
+        with open(root_path / mmap_meta_fname) as fmeta:
+            self.image_mmap_mapping = json.load(fmeta)
+            last_key = list(self.image_mmap_mapping)[-1]
+            self.nb_images = self.image_mmap_mapping[last_key]['image_idx']
+
+        mmap_meta_fname = root_path / (feature_fname.replace('.memmap', '_memmap_mapping.json'))
+        with open(root_path / mmap_meta_fname) as fmeta:
+            self.audio_mmap_mapping = json.load(fmeta)
+            last_key = list(self.audio_mmap_mapping)[-1]
+            self.nb_frames = self.audio_mmap_mapping[last_key]['audio_end']
+
+        # Load memory-map arrays
+        self.image = np.memmap(root_path / image_feature_fname, dtype='float32',
+                               mode='r', shape=(self.nb_images+1, self.image_mmap_mapping['feature_size']))
+
+        self.audio = np.memmap(root_path / feature_fname, dtype='float64',
+                               mode='r', shape=(self.nb_frames, self.audio_mmap_mapping['feature_size']))
+
+    def __getitem__(self, index):
+        # Get ids and captions
+        sd = self.split_data[index]
+        image_id = sd[0]
+        audio_id = sd[1]
+        caption = sd[2]
+
+        # Get their location in the memory-map array
+        image_idx = self.image_mmap_mapping[image_id]['image_idx']
+        audio_start = self.audio_mmap_mapping[audio_id]['audio_start']
+        audio_end = self.audio_mmap_mapping[audio_id]['audio_end']
+
+        # Retrieve features
+        image = torch.from_numpy(self.image[image_idx])
+        audio = torch.from_numpy(self.audio[audio_start:audio_end])
+        text = caption2tensor(caption)
+
+        return dict(image_id=image_id,
+                    audio_id=audio_id,
+                    image=image,
+                    audio=audio,
+                    text=text,
+                    gloss=caption)
+
+    def __len__(self):
+        return len(self.split_data)
+
+    def get_config(self):
+        return dict(feature_fname=self.feature_fname,
+                    label_encoder=self.get_label_encoder())
+
+    def evaluation(self):
+        """Returns image features, audio features, caption features, and a
+        boolean array specifying whether a caption goes with an image."""
+        audio = []
+        text = []
+        image = []
+        matches = []
+        image2idx = {}
+        for sd in self.split_data:
+            # Get ids
+            image_id = sd[0]
+            audio_id = sd[1]
+            caption = sd[2]
+
+            # Get their location in the memory-map array
+            memmap_image_idx = self.image_mmap_mapping[image_id]['image_idx']
+            memmap_audio_start = self.audio_mmap_mapping[audio_id]['audio_start']
+            memmap_audio_end = self.audio_mmap_mapping[audio_id]['audio_end']
+
+            # Add image
+            if image_id in image2idx:
+                image_idx = image2idx[image_id]
+            else:
+                image_idx = len(image)
+                image2idx[image_id] = image_idx
+                image.append(torch.from_numpy(self.image[memmap_image_idx]))
+
+            # Add audio and text
+            audio.append(torch.from_numpy(self.audio[memmap_audio_start:memmap_audio_end]))
+            text.append(caption)
+            matches.append((len(audio) - 1, image_idx))
+        correct = torch.zeros(len(audio), len(image)).bool()
+        for i, j in matches:
+            correct[i, j] = True
+
+        return dict(image=image, audio=audio, text=text, correct=correct)
+
 def batch_audio(audios, max_frames=2048):
     """Merge audio captions. Truncate to max_frames. Pad with 0s."""
     mfcc_lengths = [len(cap[:max_frames, :]) for cap in audios]
@@ -231,11 +369,11 @@ def batch_audio(audios, max_frames=2048):
 
 
 def batch_text(texts):
-    """Merge captions (from tuple of 1D tensor to 2D tensor). Pad with
+    """Merge captions, (from tuple of 1D tensor to 2D tensor). Pad with
     pad token."""
     char_lengths = [len(cap) for cap in texts]
     chars = torch.Tensor(len(texts), max(char_lengths)).long()
-    chars.fill_(Flickr8KData.get_token_id(Flickr8KData.pad))
+    chars.fill_(get_token_id(special_tokens.pad))
     for i, cap in enumerate(texts):
         end = char_lengths[i]
         chars[i, :end] = cap[:end]
@@ -298,3 +436,21 @@ def librispeech_loader(root, meta_fname, feature_fname,
         shuffle=shuffle,
         num_workers=0,
         collate_fn=lambda x: collate_fn_speech(x, max_frames=max_frames))
+
+
+def spokencoco_loader(root, meta_fname, feature_fname,
+                      split='train', batch_size=32, shuffle=False,
+                      max_frames=2048,
+                      downsampling_factor=None,
+                      debug=False):
+    return torch.utils.data.DataLoader(
+        dataset=SpokenCOCOData(root=root,
+                               feature_fname=feature_fname,
+                               meta_fname=meta_fname,
+                               split=split,
+                               downsampling_factor=downsampling_factor,
+                               debug=debug),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        collate_fn=lambda x: collate_fn(x, max_frames=max_frames))
