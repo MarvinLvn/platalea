@@ -9,6 +9,9 @@ from platalea.attention import Attention
 import platalea.hardware
 import platalea.introspect
 from platalea.vq import VQEmbeddingEMA
+import torchvision.models as models
+import argparse
+
 
 # Includes code adapted from
 # https://github.com/gchrupala/speech2image/blob/master/PyTorch/functions/encoders.py
@@ -104,6 +107,7 @@ class SpeechEncoder(nn.Module):
         x = self.Conv(input)
         # update the lengths to compensate for the convolution subsampling
         length = inout(self.Conv, length)
+
         # create a packed_sequence object. The padding will be excluded from
         # the update step thereby training on the original sequence length only
         x = nn.utils.rnn.pack_padded_sequence(
@@ -114,6 +118,7 @@ class SpeechEncoder(nn.Module):
         x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
         if self.att is not None:
             x = nn.functional.normalize(self.att(x), p=2, dim=1)
+
         return x
 
     def introspect(self, input, length):
@@ -578,6 +583,195 @@ class SpeechEncoderVQ2(nn.Module):
 
         result = {**bottom, **dict(codebook1=codebook1), **middle, **dict(codebook2=codebook2), **top}
         return result
+
+
+class RawImageEncoder(nn.Module):
+    def __init__(self, config):
+        super(RawImageEncoder, self).__init__()
+        assert config['model'] in ['resnet', 'vgg19']
+
+        # Load pretrained image models and freeze parameters
+        if config['model'] == 'resnet':
+            image_model = models.resnet152(pretrained=True)
+            image_model = nn.Sequential(*list(image_model.children())[:-1])
+        elif config['model'] == 'vgg19':
+            image_model = models.vgg19_bn(pretrained=True)
+            image_model.classifier = nn.Sequential(*list(image_model.classifier.children())[:-1])
+        image_model.to(platalea.hardware.device())
+        for p in image_model.parameters():
+            p.requires_grad = False
+        self.image_model = image_model.eval()
+        self.device = list(image_model.parameters())[0].device
+
+        # Linear (learnable) layer
+        linear = config['linear']
+        self.norm = config['norm']
+        self.linear_transform = nn.Linear(in_features=linear['in_size'],
+                                          out_features=linear['out_size'])
+        nn.init.xavier_uniform_(self.linear_transform.weight.data)
+
+    def forward(self, input):
+        n_images, n_crops, rgb, l, w = input.shape
+        input = self.image_model(input.view(n_images*n_crops, rgb, l, w)).reshape(n_images, n_crops, 2048)
+
+        input = input.mean(1).squeeze()
+
+        input = self.linear_transform(input)
+        if self.norm:
+            return nn.functional.normalize(input, p=2, dim=1)
+        else:
+            return input
+
+
+class CPCSpeechEncoder(nn.Module):
+    def __init__(self, config):
+        super(CPCSpeechEncoder, self).__init__()
+        # Load CPC model
+        from cpc.feature_loader import buildFeature, FeatureModule, loadModel
+        updateConfig = None
+        if config['gru_level'] > 0:
+            updateConfig = argparse.Namespace(nLevelsGRU=config['gru_level'])
+        self.pretrained = loadModel([config['pretrained_path']], updateConfig=updateConfig)[0]
+        self.downsampling_factor = self.pretrained.gEncoder.DOWNSAMPLING
+
+        # Freeze parameters if needed
+        if config['frozen']:
+            for p in self.pretrained.parameters():
+                p.requires_grad = False
+            self.pretrained = self.pretrained.eval()
+
+        # Initialize attention layer
+        if config['att'] is not None:
+            self.linear_att = nn.Linear(in_features=config['cpc_feature_size'],
+                                        out_features=config['att']['in_size'])
+            self.att = Attention(**config['att'])
+        else:
+            self.att = None
+
+    def forward(self, input, length):
+        x = self.pretrained.gEncoder(input.unsqueeze_(1))
+
+        # See problem with pattern pack sequence -> rnn -> unpack sequence
+        # when using multiple GPUs :
+        # https://pytorch.org/docs/stable/notes/faq.html#pack-rnn-unpack-with-data-parallelism
+        total_length = x.size(2)
+
+        # create a packed_sequence object. The padding will be excluded from
+        # the update step thereby training on the original sequence length only
+        x = nn.utils.rnn.pack_padded_sequence(
+            x.transpose(2, 1), length.cpu() // self.downsampling_factor, batch_first=True, enforce_sorted=False)
+
+        # First, forward through CPC
+        x = self.pretrained.gAR(x)
+
+        # unpack again as at the moment only rnn layers except packed_sequence
+        # objects
+        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=total_length)
+
+        # Forward through the attention layer
+        if self.att is not None:
+            x = self.linear_att(x)
+            x = nn.functional.normalize(self.att(x), p=2, dim=1)
+        return x
+
+class HubertSpeechEncoder(nn.Module):
+    def __init__(self, config):
+        super(HubertSpeechEncoder, self).__init__()
+
+
+        # Freeze parameters if needed
+        if config['frozen']:
+            for p in self.pretrained.parameters():
+                p.requires_grad = False
+            self.pretrained = self.pretrained.eval()
+
+        # Initialize attention layer
+        if config['att'] is not None:
+            self.linear_att = nn.Linear(in_features=config['cpc_feature_size'],
+                                        out_features=config['att']['in_size'])
+            self.att = Attention(**config['att'])
+        else:
+            self.att = None
+
+    def forward(self, input, length):
+        raise ValueError("Not implemented yet")
+        # x = self.pretrained.gEncoder(input.unsqueeze_(1))
+        #
+        # # See problem with pattern pack sequence -> rnn -> unpack sequence
+        # # when using multiple GPUs :
+        # # https://pytorch.org/docs/stable/notes/faq.html#pack-rnn-unpack-with-data-parallelism
+        # total_length = x.size(2)
+        #
+        # # create a packed_sequence object. The padding will be excluded from
+        # # the update step thereby training on the original sequence length only
+        # x = nn.utils.rnn.pack_padded_sequence(
+        #     x.transpose(2, 1), length.cpu() // self.downsampling_factor, batch_first=True, enforce_sorted=False)
+        #
+        # # First, forward through CPC
+        # x = self.pretrained.gAR(x)
+        #
+        # # unpack again as at the moment only rnn layers except packed_sequence
+        # # objects
+        # x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=total_length)
+
+        # Forward through the attention layer
+        if self.att is not None:
+            x = self.linear_att(x)
+            x = nn.functional.normalize(self.att(x), p=2, dim=1)
+        return x
+
+
+class Wav2VecSpeechEncoder(nn.Module):
+
+    def __init__(self, config):
+        super(Wav2VecSpeechEncoder, self).__init__()
+        # Load wav2vec 2.0 model
+        import fairseq
+        self.pretrained, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([config['pretrained_path']])
+        self.pretrained = self.pretrained[0]
+        print(self.pretrained)
+        print(vars(self.pretrained))
+        exit()
+
+        # Freeze parameters if needed
+        if config['frozen']:
+            for p in self.pretrained.parameters():
+                p.requires_grad = False
+            self.pretrained = self.pretrained.eval()
+
+        # Initialize attention layer
+        if config['att'] is not None:
+            self.linear_att = nn.Linear(in_features=config['cpc_feature_size'],
+                                        out_features=config['att']['in_size'])
+            self.att = Attention(**config['att'])
+        else:
+            self.att = None
+
+    def forward(self, input, length):
+        x = self.pretrained.gEncoder(input.unsqueeze_(1))
+
+        # See problem with pattern pack sequence -> rnn -> unpack sequence
+        # when using multiple GPUs :
+        # https://pytorch.org/docs/stable/notes/faq.html#pack-rnn-unpack-with-data-parallelism
+        total_length = x.size(2)
+
+        # create a packed_sequence object. The padding will be excluded from
+        # the update step thereby training on the original sequence length only
+        x = nn.utils.rnn.pack_padded_sequence(
+            x.transpose(2, 1), length.cpu() // self.downsampling_factor, batch_first=True, enforce_sorted=False)
+
+        # First, forward through CPC
+        x = self.pretrained.gAR(x)
+
+        # unpack again as at the moment only rnn layers except packed_sequence
+        # objects
+        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, total_length=total_length)
+
+        # Forward through the attention layer
+        if self.att is not None:
+            x = self.linear_att(x)
+            x = nn.functional.normalize(self.att(x), p=2, dim=1)
+        return x
 
 
 def inout(layer, input_length):

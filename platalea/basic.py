@@ -14,7 +14,8 @@ import platalea.hardware
 import platalea.schedulers
 from platalea.optimizers import create_optimizer
 from platalea.schedulers import create_scheduler
-
+from tqdm import tqdm
+import sys
 
 class SpeechImage(nn.Module):
     def __init__(self, config):
@@ -91,6 +92,7 @@ def experiment(net, data, config,
 
     _device = platalea.hardware.device()
     net.to(_device)
+
     net.train()
     net_parameters = net.parameters()
     optimizer = create_optimizer(config, net_parameters)
@@ -103,7 +105,8 @@ def experiment(net, data, config,
     with open("result.json", "w") as out:
         for epoch in range(1, config['epochs']+1):
             cost = Counter()
-            for j, item in enumerate(data['train'], start=1):  # check reshuffling
+            print("Start epoch %d" % epoch)
+            for j, item in tqdm(enumerate(data['train'], start=1), total=len(data['train'])):  # check reshuffling
                 wandb_step_output = {
                     "epoch": epoch,
                 }
@@ -138,7 +141,8 @@ def experiment(net, data, config,
                 wandb.log(wandb_step_output)
 
             logging.info("Saving model in net.{}.pt".format(epoch))
-            torch.save(net, "net.{}.pt".format(epoch))
+            # See : https://pytorch.org/tutorials/recipes/recipes/saving_and_loading_models_for_inference.html
+            torch.save(net.state_dict(), "net.{}.pt".format(epoch))
 
             logging.info("Calculating and saving epoch score results")
             net.eval()

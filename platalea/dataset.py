@@ -1,13 +1,20 @@
-from collections import namedtuple
 import json
-import numpy as np
 import pathlib
 import pickle
 import random
-from sklearn.preprocessing import LabelEncoder
-import torch
-import torch.utils.data
+from collections import namedtuple
+from pathlib import Path
 
+import PIL.Image
+import PIL.Image
+import numpy as np
+import soundfile as sf
+import torch
+import torch.nn.functional as F
+import torch.utils.data
+import torch.utils.data
+import torchvision.transforms as transforms
+from sklearn.preprocessing import LabelEncoder
 
 tokenizer = None
 
@@ -16,6 +23,7 @@ special_tokens = SpecialTokens('<eos>', '<pad>', '<sos>', '<unk>')
 
 # Number of files to keep in the debug mode
 NB_DEBUG = 50
+
 
 def init_vocabulary(transcriptions):
     global tokenizer
@@ -358,15 +366,30 @@ class SpokenCOCOData(torch.utils.data.Dataset):
 
         return dict(image=image, audio=audio, text=text, correct=correct)
 
+
+# Util functions to create batch
 def batch_audio(audios, max_frames=2048):
     """Merge audio captions. Truncate to max_frames. Pad with 0s."""
-    mfcc_lengths = [len(cap[:max_frames, :]) for cap in audios]
-    mfcc = torch.zeros(len(audios), max(mfcc_lengths), audios[0].size(1))
-    for i, cap in enumerate(audios):
-        end = mfcc_lengths[i]
-        mfcc[i, :end] = cap[:end]
-    return mfcc.permute(0, 2, 1), torch.tensor(mfcc_lengths)
+    permute = False
+    if len(audios[0].shape) == 1:
+        # Then we're working from the waveform
+        audio_lengths = [len(cap[:max_frames]) for cap in audios]
+        # nb audio * max_len
+        audio = torch.zeros(len(audios), max(audio_lengths))
+    else:
+        # Then we're working from MFCCs
+        audio_lengths = [len(cap[:max_frames, :]) for cap in audios]
+        # nb audio * max_len * n_features
+        audio = torch.zeros(len(audios), max(audio_lengths), audios[0].size(1))
+        permute = True
 
+    for i, cap in enumerate(audios):
+        end = audio_lengths[i]
+        audio[i, :end] = cap[:end]
+
+    if permute:
+        audio = audio.permute(0, 2, 1)
+    return audio, torch.tensor(audio_lengths)
 
 def batch_text(texts):
     """Merge captions, (from tuple of 1D tensor to 2D tensor). Pad with
@@ -379,10 +402,8 @@ def batch_text(texts):
         chars[i, :end] = cap[:end]
     return chars, torch.tensor(char_lengths)
 
-
 def batch_image(images):
     return torch.stack(images, 0)
-
 
 def collate_fn(data, max_frames=2048):
     images, texts, audios = zip(* [(datum['image'],
@@ -390,18 +411,26 @@ def collate_fn(data, max_frames=2048):
                                     datum['audio']) for datum in data])
     # Merge images (from tuple of 3D tensor to 4D tensor).
     images = batch_image(images)
-    mfcc, mfcc_lengths = batch_audio(audios, max_frames=max_frames)
+    audio, audio_lengths = batch_audio(audios, max_frames=max_frames)
     chars, char_lengths = batch_text(texts)
-    return dict(image=images, audio=mfcc, text=chars, audio_len=mfcc_lengths,
+    return dict(image=images, audio=audio, text=chars, audio_len=audio_lengths,
                 text_len=char_lengths)
-
 
 def collate_fn_speech(data, max_frames=2048):
     texts, audios = zip(* [(datum['text'],
                             datum['audio']) for datum in data])
-    mfcc, mfcc_lengths = batch_audio(audios, max_frames=max_frames)
+    audio, audio_lengths = batch_audio(audios, max_frames=max_frames)
     chars, char_lengths = batch_text(texts)
-    return dict(audio=mfcc, text=chars, audio_len=mfcc_lengths,
+    return dict(audio=audio, text=chars, audio_len=audio_lengths,
+                text_len=char_lengths)
+
+
+def collate_fn_speech(data, max_frames=327680):
+    texts, audios = zip(* [(datum['text'],
+                            datum['audio']) for datum in data])
+    audio, audio_lengths = batch_audio(audios, max_frames=max_frames)
+    chars, char_lengths = batch_text(texts)
+    return dict(audio=audio, text=chars, audio_len=audio_lengths,
                 text_len=char_lengths)
 
 
@@ -454,3 +483,176 @@ def spokencoco_loader(root, meta_fname, feature_fname,
         shuffle=shuffle,
         num_workers=0,
         collate_fn=lambda x: collate_fn(x, max_frames=max_frames))
+
+def raw_spokencoco_loader(dataset_path, metadata_path, audio_dir,
+                          normalize=False,
+                          sample_rate=16000,
+                          split='train',
+                          batch_size=32, shuffle=False,
+                          max_frames=327680,
+                          num_workers=8,
+                          debug=None):
+    return torch.utils.data.DataLoader(
+        dataset=SpokenImageCaptionsDataset(data_path=dataset_path,
+                                             metadata_path=metadata_path,
+                                             audio_dir=audio_dir,
+                                             normalize=normalize,
+                                             sample_rate=sample_rate,
+                                             split=split,
+                                             debug=debug),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=lambda x: collate_fn(x, max_frames=max_frames))
+
+
+class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
+    """
+    Dataset class that loads raw images and raw waveforms.
+    Only work for SpokenCOCO so far.
+    I think it'd be better to uniformize format between datasets rather than
+    having a class for each dataset.
+    """
+    def __init__(self, data_path, metadata_path, audio_dir='', normalize=False, sample_rate=16000,
+                 split='train', debug=None):
+        self.data_path = Path(data_path)
+        self.metadata_path = Path(metadata_path)
+        self.audio_dir = audio_dir
+        self.split = split
+        self.debug = debug
+        self.load_metadata()
+        self.normalize = normalize
+        self.sample_rate = sample_rate
+
+    @classmethod
+    def init_vocabulary(cls, dataset):
+        transcriptions = [sd[2] for sd in dataset.split_data]
+        init_vocabulary(transcriptions)
+
+    def load_metadata(self):
+        if not self.metadata_path.is_file():
+            raise FileNotFoundError("%s does not exist." % self.metadata_path)
+
+        self.image_captions = {}
+        self.split_data = []
+        with open(self.metadata_path) as fmeta:
+            metadata = json.load(fmeta)['data']
+            if self.debug:
+                metadata = metadata[:self.debug]
+
+            # Load spoken captions / image pair
+            for sample in metadata:
+                img_id = sample['image']
+                caption_list = []
+                for caption in sample['captions']:
+                    caption_list.append((caption['uttid'], caption['wav']))
+                    self.split_data.append((img_id, caption['wav'], caption['text']))
+                self.image_captions[img_id] = caption_list
+
+    def postprocess_audio(self, audio, curr_sample_rate):
+        # Handle multi-channels
+        if audio.dim() == 2:
+            audio = audio.mean(-1)
+
+        if curr_sample_rate != self.sample_rate:
+            raise Exception(f"Sample rate: {curr_sample_rate}, need {self.sample_rate}")
+
+        assert audio.dim() == 1, audio.dim()
+
+        if self.normalize:
+            with torch.no_grad():
+                audio = F.layer_norm(audio, audio.shape)
+        return audio
+
+    def load_audio(self, audio_path):
+        audio, curr_sample_rate = sf.read(audio_path, dtype="float32")
+        audio = torch.from_numpy(audio).float()
+        audio = self.postprocess_audio(audio, curr_sample_rate)
+        return audio
+
+    def load_image(self, image_path):
+        im = PIL.Image.open(image_path)
+
+
+        # some functions such as taking the ten crop (four corners, center and
+        # horizontal flip) normalise and resize.
+        tencrop = transforms.TenCrop(224)
+        tens = transforms.ToTensor()
+        normalise = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        resize = transforms.Resize(256, PIL.Image.ANTIALIAS)
+
+        # there are some grayscale images in mscoco and places that the vgg and
+        # resnet networks wont take
+        if im.mode != 'RGB':
+            im = im.convert('RGB')
+        im = tencrop(resize(im))
+        im = torch.cat([normalise(tens(x)).unsqueeze(0) for x in im])
+        return im
+
+    def __getitem__(self, index):
+        sd = self.split_data[index]
+        image_id = sd[0]
+        audio_id = sd[1]
+        caption = sd[2]
+
+        audio = self.load_audio(self.data_path / self.audio_dir / audio_id)
+        image = self.load_image(self.data_path / image_id)
+        text = caption2tensor(caption)
+
+        return dict(image_id=image_id,
+                    audio_id=audio_id,
+                    image=image,
+                    audio=audio,
+                    text=text,
+                    gloss=caption)
+
+    def __len__(self):
+        return len(self.split_data)
+
+    def evaluation(self):
+        """Returns image features, audio features, caption features, and a
+        boolean array specifying whether a caption goes with an image."""
+        audio = []
+        text = []
+        image = []
+        matches = []
+        image2idx = {}
+        for sd in self.split_data:
+            # Get ids
+            image_id = sd[0]
+            audio_id = sd[1]
+            text_sample = sd[2]
+
+            audio_sample = self.load_audio(self.data_path / self.audio_dir / audio_id)
+            image_sample = self.load_image(self.data_path / image_id)
+
+            # Add image
+            if image_id in image2idx:
+                image_idx = image2idx[image_id]
+            else:
+                image_idx = len(image)
+                image2idx[image_id] = image_idx
+                image.append(image_sample)
+
+            # Add audio and text
+            audio.append(audio_sample)
+            text.append(text_sample)
+            matches.append((len(audio) - 1, image_idx))
+        correct = torch.zeros(len(audio), len(image)).bool()
+        for i, j in matches:
+            correct[i, j] = True
+
+        return dict(image=image, audio=audio, text=text, correct=correct)
+
+
+class MyDataParallel(torch.nn.DataParallel):
+    """
+    Wrapper of DataParallel to allow having access to class attributes.
+    See : https://pytorch.org/tutorials/beginner/former_torchies/parallelism_tutorial.html
+    """
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
