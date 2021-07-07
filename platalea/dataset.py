@@ -402,8 +402,10 @@ def batch_text(texts):
         chars[i, :end] = cap[:end]
     return chars, torch.tensor(char_lengths)
 
+
 def batch_image(images):
     return torch.stack(images, 0)
+
 
 def collate_fn(data, max_frames=2048):
     images, texts, audios = zip(* [(datum['image'],
@@ -415,6 +417,7 @@ def collate_fn(data, max_frames=2048):
     chars, char_lengths = batch_text(texts)
     return dict(image=images, audio=audio, text=chars, audio_len=audio_lengths,
                 text_len=char_lengths)
+
 
 def collate_fn_speech(data, max_frames=2048):
     texts, audios = zip(* [(datum['text'],
@@ -488,18 +491,21 @@ def raw_spokencoco_loader(dataset_path, metadata_path, audio_dir,
                           normalize=False,
                           sample_rate=16000,
                           split='train',
-                          batch_size=32, shuffle=False,
+                          batch_size=32,
+                          precomputed_image=False,
+                          shuffle=False,
                           max_frames=327680,
                           num_workers=8,
                           debug=None):
     return torch.utils.data.DataLoader(
         dataset=SpokenImageCaptionsDataset(data_path=dataset_path,
-                                             metadata_path=metadata_path,
-                                             audio_dir=audio_dir,
-                                             normalize=normalize,
-                                             sample_rate=sample_rate,
-                                             split=split,
-                                             debug=debug),
+                                           metadata_path=metadata_path,
+                                           audio_dir=audio_dir,
+                                           normalize=normalize,
+                                           sample_rate=sample_rate,
+                                           split=split,
+                                           precomputed_image=precomputed_image,
+                                           debug=debug),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -514,7 +520,7 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
     having a class for each dataset.
     """
     def __init__(self, data_path, metadata_path, audio_dir='', normalize=False, sample_rate=16000,
-                 split='train', debug=None):
+                 split='train', precomputed_image=False, debug=None):
         self.data_path = Path(data_path)
         self.metadata_path = Path(metadata_path)
         self.audio_dir = audio_dir
@@ -523,6 +529,21 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
         self.load_metadata()
         self.normalize = normalize
         self.sample_rate = sample_rate
+
+        self.precomputed_image = precomputed_image
+
+        if precomputed_image:
+            image_feature_fname = 'resnet_features.memmap'
+            # Load memory map metadata
+            mmap_meta_fname = self.data_path / (image_feature_fname.replace('.memmap', '_memmap_mapping.json'))
+            with open(self.data_path / mmap_meta_fname) as fmeta:
+                self.image_mmap_mapping = json.load(fmeta)
+                last_key = list(self.image_mmap_mapping)[-1]
+                self.nb_images = self.image_mmap_mapping[last_key]['image_idx']
+            # Load memory-map arrays
+            # np.copy is just here to avoid UserWarning: The given NumPy array is not writeable.
+            self.precomputed_images = np.copy(np.memmap(self.data_path / image_feature_fname, dtype='float32',
+                                                mode='r', shape=(self.nb_images + 1, self.image_mmap_mapping['feature_size'])))
 
     @classmethod
     def init_vocabulary(cls, dataset):
@@ -573,7 +594,6 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
     def load_image(self, image_path):
         im = PIL.Image.open(image_path)
 
-
         # some functions such as taking the ten crop (four corners, center and
         # horizontal flip) normalise and resize.
         tencrop = transforms.TenCrop(224)
@@ -590,6 +610,13 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
         im = torch.cat([normalise(tens(x)).unsqueeze(0) for x in im])
         return im
 
+    def load_precomputed_image(self, image_id):
+        # Get location of the image in the memory-map array
+        image_idx = self.image_mmap_mapping[image_id]['image_idx']
+        # Retrieve features
+        image = torch.from_numpy(self.precomputed_images[image_idx])
+        return image
+
     def __getitem__(self, index):
         sd = self.split_data[index]
         image_id = sd[0]
@@ -597,7 +624,10 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
         caption = sd[2]
 
         audio = self.load_audio(self.data_path / self.audio_dir / audio_id)
-        image = self.load_image(self.data_path / image_id)
+        if self.precomputed_image:
+            image = self.load_precomputed_image(image_id)
+        else:
+            image = self.load_image(self.data_path / image_id)
         text = caption2tensor(caption)
 
         return dict(image_id=image_id,
@@ -625,7 +655,10 @@ class SpokenImageCaptionsDataset(torch.utils.data.Dataset):
             text_sample = sd[2]
 
             audio_sample = self.load_audio(self.data_path / self.audio_dir / audio_id)
-            image_sample = self.load_image(self.data_path / image_id)
+            if self.precomputed_image:
+                image_sample = self.load_precomputed_image(image_id)
+            else:
+                image_sample = self.load_image(self.data_path / image_id)
 
             # Add image
             if image_id in image2idx:

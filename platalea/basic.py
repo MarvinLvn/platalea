@@ -15,6 +15,7 @@ import platalea.schedulers
 from platalea.optimizers import create_optimizer
 from platalea.schedulers import create_scheduler
 from tqdm import tqdm
+from functools import partial
 import sys
 
 class SpeechImage(nn.Module):
@@ -49,10 +50,10 @@ class SpeechImage(nn.Module):
         image_e = np.concatenate(image_e)
         return image_e
 
-    def embed_audio(self, audios):
+    def embed_audio(self, audios, max_frames=2048):
         audio = torch.utils.data.DataLoader(dataset=audios, batch_size=32,
                                             shuffle=False,
-                                            collate_fn=D.batch_audio)
+                                            collate_fn=partial(D.batch_audio, max_frames=max_frames))
         audio_e = []
         _device = platalea.hardware.device()
         for a, l in audio:
@@ -106,7 +107,7 @@ def experiment(net, data, config,
         for epoch in range(1, config['epochs']+1):
             cost = Counter()
             print("Start epoch %d" % epoch)
-            for j, item in tqdm(enumerate(data['train'], start=1), total=len(data['train'])):  # check reshuffling
+            for j, item in enumerate(data['train'], start=1):  # check reshuffling
                 wandb_step_output = {
                     "epoch": epoch,
                 }
@@ -146,7 +147,7 @@ def experiment(net, data, config,
 
             logging.info("Calculating and saving epoch score results")
             net.eval()
-            result = platalea.score.score(net, data['val'].dataset)
+            result = platalea.score.score(net, data['val'].dataset, max_frames=config['max_frames'])
             net.train()
             result['epoch'] = epoch
             result['average_loss'] = average_loss

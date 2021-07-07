@@ -725,13 +725,13 @@ class Wav2VecSpeechEncoder(nn.Module):
 
     def __init__(self, config):
         super(Wav2VecSpeechEncoder, self).__init__()
+
         # Load wav2vec 2.0 model
-        import fairseq
-        self.pretrained, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([config['pretrained_path']])
-        self.pretrained = self.pretrained[0]
-        print(self.pretrained)
-        print(vars(self.pretrained))
+        from fairseq.models.wav2vec.wav2vec2 import Wav2Vec2Model
+        print(config['pretrained_path'])
         exit()
+        self.pretrained, cfg, task =Wav2Vec2Model.build_model([config['pretrained_path']])
+        self.pretrained = self.pretrained[0]
 
         # Freeze parameters if needed
         if config['frozen']:

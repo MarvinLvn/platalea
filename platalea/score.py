@@ -4,11 +4,12 @@ import platalea.xer as xer
 import torch
 
 
-def score(net, dataset):
+def score(net, dataset, max_frames):
     data = dataset.evaluation()
     correct = data['correct'].cpu().numpy()
     image_e = net.embed_image(data['image'])
-    audio_e = net.embed_audio(data['audio'])
+    audio_e = net.embed_audio(data['audio'], max_frames)
+
     result = E.ranking(image_e, audio_e, correct)
     return dict(medr=np.median(result['ranks']),
                 recall={1: np.mean(result['recall'][1]),
